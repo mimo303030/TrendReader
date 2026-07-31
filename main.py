@@ -3418,18 +3418,27 @@ def send_to_feishu(
     proxy_url: Optional[str] = None,
     mode: str = "daily",
 ) -> bool:
-    """发送到飞书（支持分批发送）"""
+    """发送到飞书（兼容 BotBuilder 旧 Webhook 与群自定义机器人）。"""
     headers = {"Content-Type": "application/json"}
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
+
+    # BotBuilder 已停止服务。飞书群聊的“自定义机器人”使用标准 webhook，
+    # 其请求体只接受 content.text，且单条消息限制为 20 KB。
+    is_custom_group_bot = "open.feishu.cn/open-apis/bot/" in webhook_url
+    max_bytes = CONFIG.get("FEISHU_BATCH_SIZE", 29000)
+    if is_custom_group_bot:
+        # 给批次标记、固定前缀和 UTF-8 编码保留余量，避免触发飞书 20 KB 限制。
+        max_bytes = min(max_bytes, 19000)
+        print("检测到飞书群自定义机器人 Webhook，将使用消息卡片格式（每批最多 19 KB）")
 
     # 获取分批内容，使用飞书专用的批次大小
     batches = split_content_into_batches(
         report_data,
         "feishu",
         update_info,
-        max_bytes=CONFIG.get("FEISHU_BATCH_SIZE", 29000),
+        max_bytes=max_bytes,
         mode=mode,
     )
 
@@ -3459,15 +3468,41 @@ def send_to_feishu(
         )
         now = get_beijing_time()
 
-        payload = {
-            "msg_type": "text",
-            "content": {
-                "total_titles": total_titles,
-                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "report_type": report_type,
-                "text": batch_content,
-            },
-        }
+        if is_custom_group_bot:
+            # 旧 BotBuilder 会渲染 Markdown/HTML；群自定义机器人的 text 消息则会
+            # 原样显示这些标记。改用飞书消息卡片以恢复加粗与链接的可读性。
+            # lark_md 不支持旧报告中的 <font> 标签，发送前仅移除标签并保留文字。
+            card_content = re.sub(r"</?font(?:\s+[^>]*)?>", "", batch_content, flags=re.IGNORECASE)
+            payload = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": f"TrendRadar｜{report_type}",
+                        },
+                        "template": "blue",
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": card_content},
+                        }
+                    ],
+                },
+            }
+        else:
+            # 保留旧格式，以便尚未迁移的 BotBuilder 配置仍可使用。
+            payload = {
+                "msg_type": "text",
+                "content": {
+                    "total_titles": total_titles,
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "report_type": report_type,
+                    "text": batch_content,
+                },
+            }
 
         try:
             response = requests.post(
